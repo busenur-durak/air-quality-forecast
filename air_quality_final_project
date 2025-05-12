@@ -1,0 +1,175 @@
+#necessary libraries are imported
+import requests #To retrieve data from the API.Used to connect to the OpenWeatherMap API.
+import pandas as pd  #Data analysis and DataFrame operations
+from datetime import datetime, timezone #to trade over time
+from sklearn.model_selection import train_test_split #It is used to separate the data into training and testing.
+from sklearn.ensemble import RandomForestRegressor #Random forest regression model (machine learning algorithm).
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score  #Error metrics used to evaluate the success of the model:RMSE MAE R²
+from sklearn.preprocessing import StandardScaler, LabelEncoder #To preprocess data:StandardScaler: Normalizes numeric data.LabelEncoder: Numericizes categorical data.
+import xgboost as xgb # XGBoost: A powerful regression algorithm.
+import numpy as np #Numerical calculations (matrix operations, average, standard deviation, etc.).
+import matplotlib.pyplot as plt #Libraries for plotting graphs: Matplotlib and Seaborn.
+import seaborn as sns #Libraries for plotting graphs: Matplotlib and Seaborn.
+
+# OpenWeatherMap API bilgileri #URL and API key required to pull data from OpenWeatherMap services.
+BASE_URL = "http://api.openweathermap.org/data/2.5/air_pollution"
+WEATHER_URL = "http://api.openweathermap.org/data/2.5/weather"
+API_KEY = "3a1b5d3c3e35d228d78a46f156980fc9"
+
+# Şehirlerin enlem ve boylam bilgileri #Latitude (lat) and longitude (lon) information for each city.
+CITIES = {
+    "Istanbul": {"lat": 41.0082, "lon": 28.9784},
+    "Ankara": {"lat": 39.9208, "lon": 32.8541},
+    "Izmir": {"lat": 38.4192, "lon": 27.1287},
+    "Bursa": {"lat": 40.1826, "lon": 29.0662},
+    "Antalya": {"lat": 36.8969, "lon": 30.7133}
+}
+
+def fetch_historical_data(city_name, lat, lon, api_key):#Retrieves historical air pollution data for a city.fetch is a JavaScript function that you can use to send a request to any Web API URL and get a response.
+    print(f"{city_name} için geçmiş veriler çekiliyor...")  #Writes an informational message to the console.
+    all_entries = [] #Empty list to store data.
+    current_time = int(datetime.now(tz=timezone.utc).timestamp()) #The Unix timestamp equivalent of the current time (in seconds).
+
+    for day_offset in range(1, 6): #It cycles through the last 5 days (1 through 5).
+        dt = current_time - (day_offset * 24 * 3600) #UTC time is calculated for each day. 1 day = 86400 seconds.
+        url = f"http://api.openweathermap.org/data/2.5/air_pollution/history?lat={lat}&lon={lon}&start={dt}&end={dt + 86400}&appid={api_key}" #A URL is generated for each day's air pollution data.
+
+        try: #HTTP request is being sent. If there is an error, it throws an exception.
+            response = requests.get(url)
+            response.raise_for_status()
+            data = response.json() #The incoming JSON response is converted to a Python dict.
+
+            for entry in data.get("list", []): #Loop through each weather data in key "list".
+                all_entries.append({         #Her veri noktası:Şehir adı Hava kalitesi (AQI)PM bileşenleri (co, no2 vs) Zaman bilgisieklenerek listeye alınır.
+                    "city": city_name,
+                    "aqi": entry["main"]["aqi"],
+                    **entry["components"],
+                    "timestamp": datetime.fromtimestamp(entry["dt"], tz=timezone.utc),
+                    "unix": entry["dt"]
+                })
+
+        except Exception as e:  #In case of error, a warning message is written.
+            print(f"{city_name} (gün {day_offset}) için hata: {e}")
+    return all_entries  #The data is returned as a list.
+
+def collect_extended_data(cities, api_key): #This function collects both air pollution data and weather data for all cities.
+    all_data = [] #An empty list is created to hold all the data.
+    for city, coords in cities.items():  #Each city and its coordinates (lat, lon) are taken.
+        entries = fetch_historical_data(city, coords["lat"], coords["lon"], api_key) #The previously written fetch_historical_data function is called.The pollution data for the last 5 days of that city is retrieved and placed in the entries list.
+        for entry in entries: #Loop for each air pollution data.
+            weather_url = f"{WEATHER_URL}?lat={coords['lat']}&lon={coords['lon']}&appid={api_key}&units=metric"  #OpenWeatherMap'in güncel hava durumu verisini çekmek için bir URL oluşturulur.units=metric → Sıcaklık °C olarak gelir.
+            try: #Weather data is pulled and converted to JSON.
+                weather_data = requests.get(weather_url).json()   #The following information is added to each air pollution record:Temperature (temp)Humidity (humidity)Wind speed (wind speed)
+                entry["temperature"] = weather_data["main"]["temp"]
+                entry["humidity"] = weather_data["main"]["humidity"]
+                entry["wind_speed"] = weather_data["wind"]["speed"]
+                all_data.append(entry) #The entry containing all the information is added to the all_data list.
+            except: #If weather data cannot be retrieved (for example API error), the error is suppressed and the next data is moved on.
+                continue
+    return pd.DataFrame(all_data) #All data is returned in pandas.DataFrame format.
+
+def add_time_features(df): #df: A DataFrame with a timestamp is expected.
+    df["hour"] = df["timestamp"].dt.hour  #Gets the time in the timestamp column.Creates a new column: hour
+    df["weekday"] = df["timestamp"].dt.weekday #Gets the day of the week. It works as Monday = 0, Sunday = 6. New column: weekday
+    df["month"] = df["timestamp"].dt.month #Extracts the month from the timestamp.New column: month
+    return df #Returns the DataFrame extended with the new columns.
+
+def process_data(file_path, output_path="processed_data.csv"): #file_path: Path to the input CSV file (e.g. extended_air_data.csv).output_path: Where to save the cleaned and processed data
+    data = pd.read_csv(file_path)  #It loads the data with pandas and prints it to the screen.
+    print("Veri başarıyla yüklendi!")
+
+    if data.isnull().sum().any():  #If there is missing (NaN) data: Information is given to the screen. Numerical columns are filled with the average.
+        print("Eksik veriler bulundu, dolduruluyor...")
+        data.fillna(data.mean(), inplace=True)
+    else: #If there is no missing data, information is provided.
+        print("Eksik veri bulunamadı.")
+
+    scaler = StandardScaler()  #StandardScaler: Transforms data according to z-score normalization(mean = 0, standard deviation = 1)
+    numeric_columns = ["co", "no", "no2", "o3", "so2", "nh3", "pm10", "temperature", "humidity", "wind_speed"] #The specified numerical columns (co, no, temperature, etc.) are standardized. This process allows the models to learn more accurately.
+    data[numeric_columns] = scaler.fit_transform(data[numeric_columns])
+    print("Veriler ölçeklendirildi.")
+
+    if "city" in data.columns:  #Converts city names (Istanbul, Ankara, ...) to numbers.
+        print("Kategorik veriler kodlanıyor...")
+        encoder = LabelEncoder()
+        data["city_encoded"] = encoder.fit_transform(data["city"])
+        data.drop("city", axis=1, inplace=True)
+
+    data.to_csv(output_path, index=False) #The processed data is saved to a CSV file. It is also returned.
+    print(f"İşlenmiş veriler {output_path} dosyasına kaydedildi.")
+    return data
+
+def visualize_results(model, X_test, y_test, y_pred, model_name="model"):
+    # Gerçek vs Tahmin grafiği
+    plt.figure(figsize=(8, 6))
+    plt.scatter(y_test, y_pred, alpha=0.5)
+    plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], '--r')
+    plt.xlabel("Gerçek PM2.5")
+    plt.ylabel("Tahmin PM2.5")
+    plt.title(f"Gerçek vs Tahmin PM2.5 ({model_name})")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(f"{model_name}_prediction_vs_actual.png")
+    plt.close()
+
+    # Özellik önemi grafiği (sadece destekleyen modeller için)
+    if hasattr(model, "feature_importances_"):
+        importances = model.feature_importances_
+        features = X_test.columns
+        indices = np.argsort(importances)[::-1]
+
+        plt.figure(figsize=(10, 6))
+        sns.barplot(x=importances[indices], y=features[indices])
+        plt.title(f"Özellik Önemi ({model_name})")
+        plt.xlabel("Önem")
+        plt.ylabel("Özellikler")
+        plt.tight_layout()
+        plt.savefig(f"{model_name}_feature_importance.png")
+        plt.close()
+
+def train_and_evaluate_models(file_path): #Separating training and test data
+    data = pd.read_csv(file_path) #Loading data from CSV file as pandas DataFrame.
+    print("İşlenmiş veri yüklendi!") #Prints an information message to the console: Data loaded successfully.
+
+    X = data[["co", "no", "no2", "o3", "so2", "nh3", "pm10", "temperature", "humidity", "wind_speed", "city_encoded", "hour", "weekday", "month"]]
+    y = data["pm2_5"]  #X: Feature (independent variable) columns. Air pollutants, weather, city code and time information are used. y: Target variable (dependent variable), i.e. PM2.5 level.
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42) #Splits the dataset into training (70%) and testing (30%).random_state=42 is fixed to get the same results every time.
+
+    models = {
+        "Random_Forest": RandomForestRegressor(n_estimators=100, random_state=42),
+        "XGBoost": xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, random_state=42)
+    } #Two different machine learning models are defined:RandomForestRegressor: A model based on multiple decision trees.XGBoost: A particularly fast and powerful boosting algorithm.Both models are created with 100 trees.
+
+    results = {} #An empty dictionary is created to store model success metrics.
+    for name, model in models.items():
+        print(f"{name} modeli eğitiliyor...")
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        mae = mean_absolute_error(y_test, y_pred)
+        r2 = r2_score(y_test, y_pred)
+
+        print(f"{name} Modeli: RMSE={rmse}, MAE={mae}, R²={r2}")
+        results[name] = {"RMSE": rmse, "MAE": mae, "R²": r2}
+
+        visualize_results(model, X_test, y_test, y_pred, model_name=name)
+#It is trained: model.fit(...). It makes predictions: model.predict(...). Success metrics are calculated: RMSE (root error squared), MAE (mean absolute error), R² (explained variance score). Metrics are printed and saved in the results dictionary. The visualize_results() function is called to save the actual and predicted graphs and the graphs showing the feature importance order.
+    return results #A dictionary containing the success metrics for each model is returned.
+
+if __name__ == "__main__": #In Python, this check checks that the file is executed directly.
+    data = collect_extended_data(CITIES, API_KEY) #Both air pollution and weather data are pulled for each city.
+    if not data.empty: #If the data has been pulled and the DataFrame is not empty (empty == False), the following operations are performed. That is, if the data has been pulled successfully, continue.
+        data["timestamp"] = pd.to_datetime(data["timestamp"]) #timestamp sütununu datetime tipine çevirir.
+        data = add_time_features(data) #add_time_features() fonksiyonu çağrılır.
+        save_path = "extended_air_data.csv" #The file name is defined where the raw data (including cities, pollutants, weather, time information) will be saved as a CSV file.
+        data.to_csv(save_path, index=False) #The data is written to disk as extended_air_data.csv. Using index=False prevents the row numbers from being recorded.
+        print(f"{save_path} dosyasına kaydedildi.") #Kullanıcıya veri dosyasının başarıyla kaydedildiğini bildirir.
+
+        processed_data = process_data(save_path, output_path="processed_extended.csv") #process_data() fonksiyonu çağrılır:
+
+
+        model_results = train_and_evaluate_models("processed_extended.csv")  #The processed data is loaded from "processed_extended.csv". The train_and_evaluate_models() function is called.
+    else:  #If the data is empty (data could not be retrieved, API error, etc.), an error message is displayed to the user.
+        print("Veri toplanamadı.")
